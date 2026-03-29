@@ -1,11 +1,6 @@
 # dns_packet
-
-dns_packet: DNS packet builder/parser (RFC 1035).
-
-Single-file, zero-dependency Python CLI.
-
+Single-file Python CLI tool. Zero dependencies, Python 3.8+.
 ## Usage
-
 ```bash
-python3 dns_packet.py test
+python3 dns_packet.py --test
 ```
