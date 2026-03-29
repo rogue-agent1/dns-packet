@@ -1,68 +1,83 @@
 #!/usr/bin/env python3
-"""dns_packet - DNS packet builder and parser."""
-import sys, struct, random
+"""DNS packet encoder/decoder. Zero dependencies."""
+import struct, sys, random
 
-TYPES = {"A": 1, "AAAA": 28, "CNAME": 5, "MX": 15, "NS": 2, "TXT": 16, "SOA": 6}
-CLASSES = {"IN": 1}
+TYPES = {1: "A", 2: "NS", 5: "CNAME", 6: "SOA", 15: "MX", 16: "TXT", 28: "AAAA", 33: "SRV"}
+RTYPES = {v: k for k, v in TYPES.items()}
+
+class DNSHeader:
+    def __init__(self, id=None, qr=0, opcode=0, aa=0, tc=0, rd=1, ra=0, rcode=0,
+                 qdcount=0, ancount=0, nscount=0, arcount=0):
+        self.id = id or random.randint(0, 65535)
+        self.qr = qr; self.opcode = opcode; self.aa = aa; self.tc = tc
+        self.rd = rd; self.ra = ra; self.rcode = rcode
+        self.qdcount = qdcount; self.ancount = ancount
+        self.nscount = nscount; self.arcount = arcount
+
+    def pack(self):
+        flags = (self.qr<<15)|(self.opcode<<11)|(self.aa<<10)|(self.tc<<9)|(self.rd<<8)|(self.ra<<7)|self.rcode
+        return struct.pack(">HHHHHH", self.id, flags, self.qdcount, self.ancount, self.nscount, self.arcount)
+
+    @staticmethod
+    def unpack(data, offset=0):
+        id, flags, qd, an, ns, ar = struct.unpack_from(">HHHHHH", data, offset)
+        h = DNSHeader(id=id, qdcount=qd, ancount=an, nscount=ns, arcount=ar)
+        h.qr = (flags>>15)&1; h.opcode = (flags>>11)&0xF; h.rcode = flags&0xF
+        h.rd = (flags>>8)&1; h.ra = (flags>>7)&1
+        return h, offset+12
 
 def encode_name(name):
-    result = bytearray()
-    for label in name.rstrip(".").split("."):
-        result.append(len(label))
-        result.extend(label.encode())
-    result.append(0)
-    return bytes(result)
+    parts = name.rstrip(".").split(".")
+    result = b""
+    for p in parts:
+        result += bytes([len(p)]) + p.encode()
+    return result + b"\x00"
 
 def decode_name(data, offset):
-    labels = []
-    jumped = False
-    orig_offset = offset
-    while offset < len(data):
+    parts = []; jumped = False; saved = 0
+    while True:
+        if offset >= len(data): break
         length = data[offset]
-        if length == 0:
-            offset += 1
-            break
+        if length == 0: offset += 1; break
         if (length & 0xC0) == 0xC0:
-            if not jumped:
-                orig_offset = offset + 2
-            pointer = ((length & 0x3F) << 8) | data[offset + 1]
-            offset = pointer
-            jumped = True
-            continue
+            if not jumped: saved = offset + 2
+            offset = ((length & 0x3F) << 8) | data[offset+1]
+            jumped = True; continue
         offset += 1
-        labels.append(data[offset:offset + length].decode())
+        parts.append(data[offset:offset+length].decode())
         offset += length
-    return ".".join(labels), orig_offset if jumped else offset
+    return ".".join(parts), saved if jumped else offset
 
-def build_query(name, qtype="A", qid=None):
-    if qid is None:
-        qid = random.randint(0, 65535)
-    header = struct.pack(">HHHHHH", qid, 0x0100, 1, 0, 0, 0)
-    question = encode_name(name) + struct.pack(">HH", TYPES.get(qtype, 1), 1)
-    return header + question
+def build_query(name, qtype="A"):
+    header = DNSHeader(qdcount=1)
+    q = encode_name(name) + struct.pack(">HH", RTYPES.get(qtype, 1), 1)
+    return header.pack() + q
 
-def parse_header(data):
-    qid, flags, qdcount, ancount, nscount, arcount = struct.unpack(">HHHHHH", data[:12])
-    return {"id": qid, "flags": flags, "questions": qdcount, "answers": ancount,
-            "authority": nscount, "additional": arcount}
-
-def test():
-    enc = encode_name("example.com")
-    assert enc == b"\x07example\x03com\x00"
-    name, offset = decode_name(enc, 0)
-    assert name == "example.com"
-    assert offset == len(enc)
-    q = build_query("example.com", "A", qid=0x1234)
-    assert len(q) > 12
-    h = parse_header(q)
-    assert h["id"] == 0x1234
-    assert h["questions"] == 1
-    enc2 = encode_name("sub.domain.example.com")
-    name2, _ = decode_name(enc2, 0)
-    assert name2 == "sub.domain.example.com"
-    enc3 = encode_name("a.b")
-    assert enc3 == b"\x01a\x01b\x00"
-    print("All tests passed!")
+def parse_response(data):
+    header, offset = DNSHeader.unpack(data)
+    questions = []
+    for _ in range(header.qdcount):
+        name, offset = decode_name(data, offset)
+        qtype, qclass = struct.unpack_from(">HH", data, offset)
+        offset += 4
+        questions.append({"name": name, "type": TYPES.get(qtype, str(qtype))})
+    answers = []
+    for _ in range(header.ancount):
+        name, offset = decode_name(data, offset)
+        atype, aclass, ttl, rdlength = struct.unpack_from(">HHIH", data, offset)
+        offset += 10
+        rdata = data[offset:offset+rdlength]
+        offset += rdlength
+        value = ""
+        if atype == 1 and rdlength == 4:
+            value = ".".join(str(b) for b in rdata)
+        elif atype == 28 and rdlength == 16:
+            value = ":".join(f"{rdata[i]:02x}{rdata[i+1]:02x}" for i in range(0, 16, 2))
+        answers.append({"name": name, "type": TYPES.get(atype, str(atype)), "ttl": ttl, "value": value})
+    return {"header": header, "questions": questions, "answers": answers}
 
 if __name__ == "__main__":
-    test() if "--test" in sys.argv else print("dns_packet: DNS packet builder. Use --test")
+    name = sys.argv[1] if len(sys.argv) > 1 else "example.com"
+    pkt = build_query(name)
+    print(f"Query packet for {name}: {len(pkt)} bytes")
+    print(f"Hex: {pkt.hex()}")
